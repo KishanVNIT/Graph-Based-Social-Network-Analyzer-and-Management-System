@@ -1,0 +1,1183 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <limits.h>
+#define MAX_USERS      100
+#define MAX_HOBBIES    10
+#define MAX_NAME_LEN   64
+#define MAX_STR_LEN    128
+#define INF            INT_MAX / 2   /* safe for addition */
+/* Edge weights (base = 5, subtract per shared attribute) */
+#define BASE_WEIGHT    5
+typedef long time_t;
+typedef struct EdgeNode {
+    int          friendId;
+    int          weight;
+    time_t       connectedAt;
+    struct EdgeNode *next;
+} EdgeNode;
+
+typedef struct User {
+    int    id;
+    int    active;
+    char   name[MAX_NAME_LEN];
+    char   school[MAX_STR_LEN];
+    char   college[MAX_STR_LEN];
+    char   company[MAX_STR_LEN];
+    char   hobbies[MAX_HOBBIES][MAX_NAME_LEN];
+    int    hobbyCount;
+    /* directed edges for topological sort (career edges) */
+    int    careerNext[MAX_USERS];   /* users this user "mentored/led-to" */
+    int    careerNextCount;
+    EdgeNode *adj;
+} User;
+
+typedef struct Graph {
+    User  users[MAX_USERS];
+    int   userCount;     
+    int   activeCount;
+    int   nextId;         
+} Graph;
+
+typedef struct DSU {
+    int parent[MAX_USERS];
+    int rnk[MAX_USERS];
+} DSU;
+
+typedef struct WEdge{
+    int u;
+    int v;
+    int w;
+} WEdge;
+
+void printLine(char c, int n) {
+    for (int i = 0; i < n; i++){
+      printf("%c", c);
+    }
+    printf("\n");
+}
+void printBanner(const char *title) {
+    printLine('=', 60);
+    printf("  %s\n", title);
+    printLine('=', 60);
+}
+
+int findUserIndex(Graph *g, int id) {
+    for (int i = 0; i < g->userCount; i++){
+        if (g->users[i].active && g->users[i].id == id){
+            return i;
+          }
+    }
+    return -1;
+}
+
+/* FIX 3: bounded loop in case-insensitive name search */
+int findUserByName(Graph *g, const char *name) {
+    for (int i = 0; i < g->userCount; i++) {
+        if (!g->users[i].active) continue;
+        char ln[MAX_NAME_LEN], lt[MAX_NAME_LEN];
+        int k;
+        for (k = 0; g->users[i].name[k] && k < MAX_NAME_LEN - 1; k++)
+            ln[k] = (g->users[i].name[k] >= 'A' && g->users[i].name[k] <= 'Z')
+                     ? g->users[i].name[k] + 32 : g->users[i].name[k];
+        ln[k] = '\0';
+        for (k = 0; name[k] && k < MAX_NAME_LEN - 1; k++)
+            lt[k] = (name[k] >= 'A' && name[k] <= 'Z') ? name[k] + 32 : name[k];
+        lt[k] = '\0';
+        if (strstr(ln, lt)) return i;
+    }
+    return -1;
+}
+int computeWeight(User *a, User *b) {
+    int w = BASE_WEIGHT;
+    if (strlen(a->college) > 0 && strcmp(a->college, b->college) == 0){
+       w--;
+      }
+    if (strlen(a->company) > 0 && strcmp(a->company, b->company) == 0){
+      w--;
+      }
+    if (strlen(a->school)  > 0 && strcmp(a->school,  b->school)  == 0){
+       w--;
+      }
+    for (int i = 0; i < a->hobbyCount; i++){
+        for (int j = 0; j < b->hobbyCount; j++){
+            if (strcmp(a->hobbies[i], b->hobbies[j]) == 0) {
+               w--; 
+               goto done; 
+              }
+            
+        }
+      }
+done:
+    return (w < 1) ? 1 : w;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   DSU
+   ═══════════════════════════════════════════════════════════════ */
+
+void dsuInit(DSU *d, int n) {
+    for (int i = 0; i < n; i++) { d->parent[i] = i; d->rnk[i] = 0; }
+}
+int dsuFind(DSU *d, int x) {
+    if (d->parent[x] != x) d->parent[x] = dsuFind(d, d->parent[x]);
+    return d->parent[x];
+}
+int dsuUnion(DSU *d, int x, int y) {
+    int px = dsuFind(d, x), py = dsuFind(d, y);
+    if (px == py) return 0;
+    if (d->rnk[px] < d->rnk[py]) { int t = px; px = py; py = t; }
+    d->parent[py] = px;
+    if (d->rnk[px] == d->rnk[py]) d->rnk[px]++;
+    return 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   FIX 1: removeEdge() is a proper top-level function
+   ═══════════════════════════════════════════════════════════════ */
+
+void removeEdge(User *u, int fid) {
+    EdgeNode *prev = NULL, *cur = u->adj;
+    while (cur) {
+        if (cur->friendId == fid) {
+            if (prev) prev->next = cur->next;
+            else      u->adj    = cur->next;
+            free(cur);
+            return;
+        }
+        prev = cur; cur = cur->next;
+    }
+}
+int addUser(Graph *g, const char *name,
+            const char *school, const char *college, const char *company,
+            const char **hobbies, int hobbyCount) {
+
+    int slot = -1;
+    for(int i=0;i <g->userCount;i++){
+        if (!g->users[i].active) { 
+          slot = i; 
+          break;
+         }
+        }
+    if (slot == -1) {
+        if (g->userCount >= MAX_USERS) {
+           printf("[ERROR] Network full.\n"); 
+           return -1;
+           }
+        slot = g->userCount++;
+    }
+   
+    User *u      = &g->users[slot];
+    memset(u, 0, sizeof(User));
+    u->id        = ++g->nextId;
+    u->active    = 1;
+    u->adj       = NULL;
+    u->hobbyCount = 0;
+    u->careerNextCount = 0;
+
+ 
+    strncpy(u->name,    name,    MAX_NAME_LEN - 1);
+     u->name[MAX_NAME_LEN - 1]   = '\0';
+    strncpy(u->school,  school,  MAX_STR_LEN  - 1);
+     u->school[MAX_STR_LEN - 1]  = '\0';
+    strncpy(u->college, college, MAX_STR_LEN  - 1);
+     u->college[MAX_STR_LEN - 1] = '\0';
+    strncpy(u->company, company, MAX_STR_LEN  - 1);
+     u->company[MAX_STR_LEN - 1] = '\0';
+
+    for (int i = 0; i < hobbyCount && i < MAX_HOBBIES; i++) {
+        strncpy(u->hobbies[i], hobbies[i], MAX_NAME_LEN - 1);
+        u->hobbies[i][MAX_NAME_LEN - 1] = '\0';
+        u->hobbyCount++;
+    }
+    g->activeCount++;
+    printf(" User '%s' registered  (id=%d, slot=%d)\n", u->name, u->id, slot);
+    return u->id;
+}
+
+void deleteUser(Graph *g, int id) {
+    int idx = findUserIndex(g, id);
+    if (idx == -1) { printf("[ERROR] User id=%d not found.\n", id); return; }
+
+    /* Remove all incident edges from other users */
+    for (int i = 0; i < g->userCount; i++) {
+        if (!g->users[i].active || i == idx) continue;
+        removeEdge(&g->users[i], id);
+    }
+    /* Free this user's own adjacency list */
+    EdgeNode *cur = g->users[idx].adj;
+    while (cur) { EdgeNode *tmp = cur; cur = cur->next; free(tmp); }
+
+    printf("[-] User '%s' (id=%d) deleted.\n", g->users[idx].name, id);
+    /* FIX 13: mark slot free but do NOT decrement userCount */
+    g->users[idx].active = 0;
+    g->users[idx].adj    = NULL;
+    g->activeCount--;
+}
+
+static void addDirectedEdge(User *u, int friendId, int weight) {
+    for (EdgeNode *e = u->adj; e; e = e->next){
+        if(e->friendId==friendId){
+              return;
+         }
+      }
+    EdgeNode *node    = (EdgeNode *)malloc(sizeof(EdgeNode));
+    node->friendId    = friendId;
+    node->weight      = weight;
+    node->connectedAt = time(NULL);
+    node->next        = u->adj;
+    u->adj            = node;
+}
+
+void addConnection(Graph *g, int idA, int idB) {
+    int ia = findUserIndex(g, idA);
+    int ib = findUserIndex(g, idB);
+    if (ia == -1 || ib == -1) {
+       printf("[ERROR] User(s) not found.\n");
+       return;
+       }
+    int w = computeWeight(&g->users[ia], &g->users[ib]);
+    addDirectedEdge(&g->users[ia], idB, w);
+    addDirectedEdge(&g->users[ib], idA, w);
+    printf("Connected: %-12s ↔ %-12s  (weight=%d)\n",g->users[ia].name, g->users[ib].name, w);
+}
+
+void removeConnection(Graph *g, int idA, int idB) {
+    int ia = findUserIndex(g, idA), ib = findUserIndex(g, idB);
+    if (ia == -1 || ib == -1) { printf("[ERROR] User(s) not found.\n"); return; }
+    removeEdge(&g->users[ia], idB);
+    removeEdge(&g->users[ib], idA);
+    printf("[-] Connection removed: %s ↔ %s\n", g->users[ia].name, g->users[ib].name);
+}
+
+void bfsLevels(Graph *g, int srcId, int maxLevel) {
+    int src = findUserIndex(g, srcId);
+    if (src == -1) {
+       printf("[ERROR] Source not found.\n");
+        return; 
+      }
+
+    printBanner("BFS – Friends by Level of Separation");
+    printf("Source: %s\n\n", g->users[src].name);
+
+    int visited[MAX_USERS] = {0}, dist[MAX_USERS];
+    int queue[MAX_USERS], front = 0, back = 0;
+    for (int i = 0; i < MAX_USERS; i++) dist[i] = -1;
+    visited[src] = 1; dist[src] = 0; queue[back++] = src;
+
+    while (front < back) {
+        int u = queue[front++];
+        if (dist[u] >= maxLevel) continue;
+        for (EdgeNode *e = g->users[u].adj; e; e = e->next) {
+            int v = findUserIndex(g, e->friendId);
+            if (v == -1 || !g->users[v].active || visited[v]) continue;
+            visited[v] = 1; dist[v] = dist[u] + 1; queue[back++] = v;
+        }
+    }
+    for (int level = 1; level <= maxLevel; level++) {
+        printf("  Level %d:\n", level);
+        int found = 0;
+        for (int i = 0; i < g->userCount; i++)
+            if (g->users[i].active && dist[i] == level) {
+                printf("    → %s (id=%d)\n", g->users[i].name, g->users[i].id);
+                found = 1;
+            }
+        if (!found) printf("    (none)\n");
+    }
+}
+
+ void dfsUtil(Graph *g, int u, int visited[]) {
+    visited[u] = 1;
+    printf("  → %s (id=%d)\n", g->users[u].name, g->users[u].id);
+    for (EdgeNode *e = g->users[u].adj; e; e = e->next) {
+        int v = findUserIndex(g, e->friendId);
+        if (v != -1 && g->users[v].active && !visited[v])
+            dfsUtil(g, v, visited);
+    }
+}
+
+void dfsTraversal(Graph *g, int srcId) {
+    int src = findUserIndex(g, srcId);
+    if (src == -1) { 
+      printf("[ERROR] Source not found.\n"); 
+      return; 
+    }
+    printBanner("DFS – Complete Network Exploration");
+    printf("Starting from: %s\n\n", g->users[src].name);
+    int visited[MAX_USERS] = {0};
+    dfsUtil(g, src, visited);
+    for (int i = 0; i < g->userCount; i++)
+        if (g->users[i].active && !visited[i])
+            dfsUtil(g, i, visited);
+}
+
+
+void addCareerEdge(Graph *g, int fromId, int toId) {
+    int fi = findUserIndex(g, fromId);
+    int ti = findUserIndex(g, toId);
+    if(fi == -1 || ti == -1){ 
+      printf("[ERROR] User(s) not found.\n"); 
+      return; 
+    }
+    User *u = &g->users[fi];
+    for (int k=0; k<u->careerNextCount;k++){
+        if(u->careerNext[k]==ti){ 
+          return;
+        } 
+      } 
+    if (u->careerNextCount < MAX_USERS){
+        u->careerNext[u->careerNextCount++] = ti;
+    }
+    printf(" Career edge: %s → %s\n", g->users[fi].name, g->users[ti].name);
+}
+
+void topologicalSort(Graph *g) {
+    printBanner("Topological Sort – Career/Mentorship Order (Kahn's BFS)");
+
+    int indegree[MAX_USERS] = {0};
+    int n = g->userCount;
+    for (int i = 0; i < n; i++) {
+        if (!g->users[i].active) {
+          continue;
+        }
+        for (int k = 0; k < g->users[i].careerNextCount; k++) {
+            int v = g->users[i].careerNext[k];
+            if (v >= 0 && v < n && g->users[v].active){
+                indegree[v]++;
+            }
+        }
+    }
+
+    int queue[MAX_USERS];
+    int front = 0;
+    int back = 0;
+    for (int i = 0; i < n; i++){
+        if (g->users[i].active && indegree[i] == 0){
+           queue[back++] = i;
+           }
+        }
+
+    if (back == 0){ 
+      printf("  No source nodes (or no career edges defined).\n");
+       return; 
+      }
+
+    int step = 1;
+    while (front < back){
+        int u = queue[front++];
+        printf("  Step %d: %s\n", step++, g->users[u].name);
+        for (int k = 0; k < g->users[u].careerNextCount; k++) {
+            int v = g->users[u].careerNext[k];
+            if (v < 0 || v >= n || !g->users[v].active) continue;
+            if (--indegree[v] == 0) queue[back++] = v;
+        }
+    }
+    if (step - 1 < g->activeCount)
+        printf("  [!] Cycle detected in career edges — not all nodes sorted.\n");
+}
+
+void primMST(Graph *g) {
+    
+    int revMap[MAX_USERS];
+    int  idxMap[MAX_USERS];
+    int k = 0;
+    for (int i = 0; i < g->userCount; i++) {
+        idxMap[i] = g->users[i].active ? k : -1;
+        if (g->users[i].active) revMap[k++] = i;
+    }
+    if (k == 0) {
+       printf("No active users.\n"); 
+       return; 
+      }
+
+    int mat[MAX_USERS][MAX_USERS];
+    for (int i = 0; i < k; i++){
+     for (int j = 0; j < k; j++){ 
+      mat[i][j] = INF;
+      }
+    }
+    for (int i = 0; i < g->userCount; i++) {
+        if (!g->users[i].active) continue;
+        int u = idxMap[i];
+        for (EdgeNode *e = g->users[i].adj; e; e = e->next) {
+            int j = findUserIndex(g, e->friendId);
+            if (j == -1) continue;
+            int v = idxMap[j];
+            if (e->weight < mat[u][v]) mat[u][v] = mat[v][u] = e->weight;
+        }
+    }
+
+    int inMST[MAX_USERS] = {0};
+    int key[MAX_USERS];
+    int  parent[MAX_USERS];
+    for (int i = 0; i < k; i++) { 
+      key[i] = INF; 
+      parent[i] = -1;
+     }
+
+    printBanner("Prim's MST – Minimum Cost Network (Forest)");
+    int totalWeight = 0;
+    
+    /* FIX 5: loop over all nodes to handle disconnected components */
+    for (int start = 0; start < k; start++) {
+        if (inMST[start]) continue;   /* already in MST */
+        key[start] = 0;
+
+        for (int iter = 0; iter < k; iter++) {
+            /* FIX 4: guard u == -1 */
+            int u = -1;
+            for (int i = 0; i < k; i++)
+                if (!inMST[i] && key[i] != INF && (u == -1 || key[i] < key[u])) u = i;
+            if (u == -1) break;   /* remaining nodes unreachable from this component */
+            inMST[u] = 1;
+            if (parent[u] != -1) {
+                printf("  Edge: %-15s ── %-15s  w=%d\n",
+                       g->users[revMap[parent[u]]].name,
+                       g->users[revMap[u]].name, key[u]);
+                totalWeight += key[u];
+            }
+            for (int v = 0; v < k; v++)
+                if (!inMST[v] && mat[u][v] != INF && mat[u][v] < key[v]) {
+                    key[v] = mat[u][v]; parent[v] = u;
+                }
+        }
+    }
+    printf("\n  Total MST/Forest weight: %d\n", totalWeight);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Kruskal's MST
+   ═══════════════════════════════════════════════════════════════ */
+
+int cmpEdges(const void *a, const void *b) {
+    return ((WEdge *)a)->w - ((WEdge *)b)->w;
+}
+
+void kruskalMST(Graph *g) {
+    WEdge edges[MAX_USERS * MAX_USERS]; int eCnt = 0;
+    for (int i = 0; i < g->userCount; i++) {
+        if (!g->users[i].active) continue;
+        for (EdgeNode *e = g->users[i].adj; e; e = e->next) {
+            int j = findUserIndex(g, e->friendId);
+            if (j == -1 || j <= i) continue;
+            edges[eCnt].u = i; edges[eCnt].v = j; edges[eCnt].w = e->weight; eCnt++;
+        }
+    }
+    qsort(edges, eCnt, sizeof(WEdge), cmpEdges);
+    DSU dsu; dsuInit(&dsu, g->userCount);
+    printBanner("Kruskal's MST – Minimum Cost Network");
+    int totalWeight = 0;
+    for (int i = 0; i < eCnt; i++) {
+        int u = edges[i].u, v = edges[i].v, w = edges[i].w;
+        if (dsuUnion(&dsu, u, v)) {
+            printf("  Edge: %-15s ── %-15s  w=%d\n",
+                   g->users[u].name, g->users[v].name, w);
+            totalWeight += w;
+        }
+    }
+    printf("\n  Total MST weight: %d\n", totalWeight);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   5. Dijkstra – Single Source Shortest Path
+   ═══════════════════════════════════════════════════════════════ */
+
+void dijkstra(Graph *g, int srcId) {
+    int src = findUserIndex(g, srcId);
+    if (src == -1) { printf("[ERROR] Source not found.\n"); return; }
+    int n = g->userCount;
+    int dist[MAX_USERS], visited[MAX_USERS], prev[MAX_USERS];
+    for (int i = 0; i < n; i++) { dist[i] = INF; visited[i] = 0; prev[i] = -1; }
+    dist[src] = 0;
+
+    for (int iter = 0; iter < n; iter++) {
+        int u = -1;
+        for (int i = 0; i < n; i++)
+            if (!visited[i] && g->users[i].active && (u == -1 || dist[i] < dist[u])) u = i;
+        if (u == -1 || dist[u] == INF) break;
+        visited[u] = 1;
+        for (EdgeNode *e = g->users[u].adj; e; e = e->next) {
+            int v = findUserIndex(g, e->friendId);
+            if (v == -1 || !g->users[v].active) continue;
+            if (dist[u] + e->weight < dist[v]) { dist[v] = dist[u] + e->weight; prev[v] = u; }
+        }
+    }
+
+    printBanner("Dijkstra – Single Source Shortest Path");
+    printf("Source: %s\n\n", g->users[src].name);
+    for (int i = 0; i < n; i++) {
+        if (!g->users[i].active || i == src) continue;
+        if (dist[i] == INF) { printf("  %-15s : unreachable\n", g->users[i].name); continue; }
+        printf("  %-15s : dist=%-3d  path: ", g->users[i].name, dist[i]);
+        int path[MAX_USERS], pLen = 0, cur = i;
+        while (cur != -1) { path[pLen++] = cur; cur = prev[cur]; }
+        for (int p = pLen - 1; p >= 0; p--) {
+            printf("%s", g->users[path[p]].name);
+            if (p > 0) printf(" → ");
+        }
+        printf("\n");
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   FIX 10: Floyd-Warshall with PATH RECONSTRUCTION via next[][]
+   ═══════════════════════════════════════════════════════════════ */
+
+void floydWarshall(Graph *g) {
+    int revMap[MAX_USERS], k = 0, idxMap[MAX_USERS];
+    for (int i = 0; i < g->userCount; i++) {
+        idxMap[i] = g->users[i].active ? k : -1;
+        if (g->users[i].active) revMap[k++] = i;
+    }
+
+    int dist[MAX_USERS][MAX_USERS], nxt[MAX_USERS][MAX_USERS];
+    for (int i = 0; i < k; i++)
+        for (int j = 0; j < k; j++) {
+            dist[i][j] = (i == j) ? 0 : INF;
+            nxt[i][j]  = (i == j) ? i : -1;
+        }
+
+    for (int i = 0; i < g->userCount; i++) {
+        if (!g->users[i].active) continue;
+        int u = idxMap[i];
+        for (EdgeNode *e = g->users[i].adj; e; e = e->next) {
+            int j = findUserIndex(g, e->friendId);
+            if (j == -1) continue;
+            int v = idxMap[j];
+            if (e->weight < dist[u][v]) { dist[u][v] = dist[v][u] = e->weight; nxt[u][v] = v; nxt[v][u] = u; }
+        }
+    }
+    for (int m = 0; m < k; m++)
+        for (int i = 0; i < k; i++)
+            for (int j = 0; j < k; j++)
+                if (dist[i][m] != INF && dist[m][j] != INF &&
+                    dist[i][m] + dist[m][j] < dist[i][j]) {
+                    dist[i][j] = dist[i][m] + dist[m][j];
+                    nxt[i][j]  = nxt[i][m];
+                }
+
+    printBanner("Floyd-Warshall – All-Pair Shortest Paths");
+
+    /* Distance matrix */
+    printf("\n  [Distance Matrix]\n  %-15s", "");
+    for (int j = 0; j < k; j++) printf("%-10s", g->users[revMap[j]].name);
+    printf("\n"); printLine('-', 60);
+    for (int i = 0; i < k; i++) {
+        printf("  %-15s", g->users[revMap[i]].name);
+        for (int j = 0; j < k; j++)
+            if (dist[i][j] == INF) printf("%-10s", "INF"); else printf("%-10d", dist[i][j]);
+        printf("\n");
+    }
+
+    /* Path reconstruction for every pair */
+    printf("\n  [Path Reconstruction]\n");
+    for (int i = 0; i < k; i++) {
+        for (int j = 0; j < k; j++) {
+            if (i == j) continue;
+            if (nxt[i][j] == -1) {
+                printf("  %-10s → %-10s : no path\n",
+                       g->users[revMap[i]].name, g->users[revMap[j]].name);
+                continue;
+            }
+            printf("  %-10s → %-10s : ", g->users[revMap[i]].name, g->users[revMap[j]].name);
+            int cur = i;
+            while (cur != j) {
+                printf("%s → ", g->users[revMap[cur]].name);
+                cur = nxt[cur][j];
+                if (cur == -1) { printf("(error)"); break; }
+            }
+            printf("%s  (dist=%d)\n", g->users[revMap[j]].name, dist[i][j]);
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   FIX 7: Search via actual BFS traversal
+   ═══════════════════════════════════════════════════════════════ */
+
+static int matchAttr(User *u, const char *attr, const char *value) {
+    if (strcmp(attr, "name")    == 0 && strstr(u->name,    value)) return 1;
+    if (strcmp(attr, "school")  == 0 && strcmp(u->school,  value) == 0) return 1;
+    if (strcmp(attr, "college") == 0 && strcmp(u->college, value) == 0) return 1;
+    if (strcmp(attr, "company") == 0 && strcmp(u->company, value) == 0) return 1;
+    if (strcmp(attr, "hobby")   == 0)
+        for (int h = 0; h < u->hobbyCount; h++)
+            if (strcmp(u->hobbies[h], value) == 0) return 1;
+    return 0;
+}
+
+void searchByBFS(Graph *g, int srcId, const char *attr, const char *value) {
+    int src = findUserIndex(g, srcId);
+    if (src == -1) { printf("[ERROR] Source not found.\n"); return; }
+    printBanner("BFS Search");
+    printf("  Attribute: %s = \"%s\"  (BFS from %s)\n\n", attr, value, g->users[src].name);
+
+    int visited[MAX_USERS] = {0}, queue[MAX_USERS], front = 0, back = 0;
+    visited[src] = 1; queue[back++] = src;
+    int found = 0;
+    while (front < back) {
+        int u = queue[front++];
+        if (matchAttr(&g->users[u], attr, value)) {
+            printf("  [FOUND via BFS] %-15s  college=%-15s  company=%s\n",
+                   g->users[u].name, g->users[u].college, g->users[u].company);
+            found++;
+        }
+        for (EdgeNode *e = g->users[u].adj; e; e = e->next) {
+            int v = findUserIndex(g, e->friendId);
+            if (v != -1 && g->users[v].active && !visited[v]) {
+                visited[v] = 1; queue[back++] = v;
+            }
+        }
+    }
+    /* Also visit unvisited components */
+    for (int i = 0; i < g->userCount; i++) {
+        if (!g->users[i].active || visited[i]) continue;
+        visited[i] = 1; queue[back++] = i;
+        while (front < back) {
+            int u = queue[front++];
+            if (matchAttr(&g->users[u], attr, value)) {
+                printf("  [FOUND via BFS] %-15s  college=%-15s  company=%s\n",
+                       g->users[u].name, g->users[u].college, g->users[u].company);
+                found++;
+            }
+            for (EdgeNode *e = g->users[u].adj; e; e = e->next) {
+                int v = findUserIndex(g, e->friendId);
+                if (v != -1 && g->users[v].active && !visited[v]) {
+                    visited[v] = 1; queue[back++] = v;
+                }
+            }
+        }
+    }
+    printf("\n  Total found: %d\n", found);
+}
+
+static void dfsSearchUtil(Graph *g, int u, int visited[],
+                           const char *attr, const char *value, int *found) {
+    visited[u] = 1;
+    if (matchAttr(&g->users[u], attr, value)) {
+        printf("  [FOUND via DFS] %-15s  college=%-15s  company=%s\n",
+               g->users[u].name, g->users[u].college, g->users[u].company);
+        (*found)++;
+    }
+    for (EdgeNode *e = g->users[u].adj; e; e = e->next) {
+        int v = findUserIndex(g, e->friendId);
+        if (v != -1 && g->users[v].active && !visited[v])
+            dfsSearchUtil(g, v, visited, attr, value, found);
+    }
+}
+
+void searchByDFS(Graph *g, int srcId, const char *attr, const char *value) {
+    int src = findUserIndex(g, srcId);
+    if (src == -1) { printf("[ERROR] Source not found.\n"); return; }
+    printBanner("DFS Search");
+    printf("  Attribute: %s = \"%s\"  (DFS from %s)\n\n", attr, value, g->users[src].name);
+    int visited[MAX_USERS] = {0}, found = 0;
+    dfsSearchUtil(g, src, visited, attr, value, &found);
+    for (int i = 0; i < g->userCount; i++)
+        if (g->users[i].active && !visited[i])
+            dfsSearchUtil(g, i, visited, attr, value, &found);
+    printf("\n  Total found: %d\n", found);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   FIX 8: isConnected(A, B) via BFS
+   ═══════════════════════════════════════════════════════════════ */
+
+int isConnected(Graph *g, int idA, int idB) {
+    int src = findUserIndex(g, idA), dst = findUserIndex(g, idB);
+    if (src == -1 || dst == -1) return -1;
+    if (src == dst) return 1;
+    int visited[MAX_USERS] = {0}, queue[MAX_USERS], front = 0, back = 0;
+    visited[src] = 1; queue[back++] = src;
+    while (front < back) {
+        int u = queue[front++];
+        for (EdgeNode *e = g->users[u].adj; e; e = e->next) {
+            int v = findUserIndex(g, e->friendId);
+            if (v == -1 || !g->users[v].active) continue;
+            if (v == dst) return 1;
+            if (!visited[v]) { visited[v] = 1; queue[back++] = v; }
+        }
+    }
+    return 0;
+}
+
+void checkConnection(Graph *g, int idA, int idB) {
+    int ia = findUserIndex(g, idA), ib = findUserIndex(g, idB);
+    if (ia == -1 || ib == -1) { printf("[ERROR] User(s) not found.\n"); return; }
+    int res = isConnected(g, idA, idB);
+    printf("\n  isConnected(%s, %s) → %s\n",
+           g->users[ia].name, g->users[ib].name,
+           res == 1 ? "YES ✔" : "NO ✘");
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   FIX 9: degreeOfSeparation(A, B)
+   ═══════════════════════════════════════════════════════════════ */
+
+int degreeOfSeparation(Graph *g, int idA, int idB) {
+    int src = findUserIndex(g, idA), dst = findUserIndex(g, idB);
+    if (src == -1 || dst == -1) return -1;
+    if (src == dst) return 0;
+    int dist[MAX_USERS], visited[MAX_USERS] = {0};
+    int queue[MAX_USERS], front = 0, back = 0;
+    for (int i = 0; i < MAX_USERS; i++) dist[i] = -1;
+    dist[src] = 0; visited[src] = 1; queue[back++] = src;
+    while (front < back) {
+        int u = queue[front++];
+        for (EdgeNode *e = g->users[u].adj; e; e = e->next) {
+            int v = findUserIndex(g, e->friendId);
+            if (v == -1 || !g->users[v].active || visited[v]) continue;
+            visited[v] = 1; dist[v] = dist[u] + 1;
+            if (v == dst) return dist[v];
+            queue[back++] = v;
+        }
+    }
+    return -1;   /* not reachable */
+}
+
+void printDegreeOfSeparation(Graph *g, int idA, int idB) {
+    int ia = findUserIndex(g, idA), ib = findUserIndex(g, idB);
+    if (ia == -1 || ib == -1) { printf("[ERROR] User(s) not found.\n"); return; }
+    int d = degreeOfSeparation(g, idA, idB);
+    if (d == -1) printf("\n  %s and %s are NOT connected.\n",
+                        g->users[ia].name, g->users[ib].name);
+    else printf("\n  Degree of separation between %s and %s: %d\n",
+                g->users[ia].name, g->users[ib].name, d);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Cycle Detection (DFS + Union-Find)
+   ═══════════════════════════════════════════════════════════════ */
+
+static int cycleHelper(Graph *g, int u, int visited[], int parent) {
+    visited[u] = 1;
+    for (EdgeNode *e = g->users[u].adj; e; e = e->next) {
+        int v = findUserIndex(g, e->friendId);
+        if (v == -1 || !g->users[v].active) continue;
+        if (!visited[v]) { if (cycleHelper(g, v, visited, u)) return 1; }
+        else if (v != parent) return 1;
+    }
+    return 0;
+}
+
+void detectCycle(Graph *g) {
+    printBanner("Cycle Detection");
+    int visited[MAX_USERS] = {0}, hasCycle = 0;
+    for (int i = 0; i < g->userCount; i++) {
+        if (g->users[i].active && !visited[i])
+            if (cycleHelper(g, i, visited, -1)) { hasCycle = 1; break; }
+    }
+    printf("  DFS result   : %s\n", hasCycle ? "Cycle DETECTED!" : "No cycle.");
+
+    DSU dsu; dsuInit(&dsu, g->userCount);
+    int cycleUF = 0;
+    for (int i = 0; i < g->userCount; i++) {
+        if (!g->users[i].active) continue;
+        for (EdgeNode *e = g->users[i].adj; e; e = e->next) {
+            int j = findUserIndex(g, e->friendId);
+            if (j == -1 || j <= i) continue;
+            if (!dsuUnion(&dsu, i, j)) { cycleUF = 1; break; }
+        }
+        if (cycleUF) break;
+    }
+    printf("  Union-Find   : %s\n", cycleUF ? "Cycle DETECTED!" : "No cycle.");
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   All Paths (Backtracking DFS)
+   ═══════════════════════════════════════════════════════════════ */
+
+static int pathStack[MAX_USERS], pathLen = 0, pathCount = 0;
+
+static void allPathsUtil(Graph *g, int u, int dest, int visited[]) {
+    visited[u] = 1; pathStack[pathLen++] = u;
+    if (u == dest) {
+        printf("  Path %d: ", ++pathCount);
+        for (int i = 0; i < pathLen; i++) {
+            printf("%s", g->users[pathStack[i]].name);
+            if (i < pathLen - 1) printf(" → ");
+        }
+        printf("\n");
+    } else {
+        for (EdgeNode *e = g->users[u].adj; e; e = e->next) {
+            int v = findUserIndex(g, e->friendId);
+            if (v != -1 && g->users[v].active && !visited[v])
+                allPathsUtil(g, v, dest, visited);
+        }
+    }
+    pathLen--; visited[u] = 0;
+}
+
+void allPaths(Graph *g, int srcId, int dstId) {
+    int src = findUserIndex(g, srcId), dst = findUserIndex(g, dstId);
+    if (src == -1 || dst == -1) { printf("[ERROR] User(s) not found.\n"); return; }
+    printBanner("All Paths – Backtracking DFS");
+    printf("From: %s  →  To: %s\n\n", g->users[src].name, g->users[dst].name);
+    int visited[MAX_USERS] = {0};
+    pathLen = 0; pathCount = 0;
+    allPathsUtil(g, src, dst, visited);
+    if (pathCount == 0) printf("  No paths found.\n");
+    else printf("\n  Total paths: %d\n", pathCount);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Graph Diameter
+   ═══════════════════════════════════════════════════════════════ */
+
+void graphDiameter(Graph *g) {
+    printBanner("Graph Diameter – Maximum Degree of Separation");
+    int maxDist = 0, uMax = -1, vMax = -1;
+    for (int s = 0; s < g->userCount; s++) {
+        if (!g->users[s].active) continue;
+        int dist[MAX_USERS], visited[MAX_USERS] = {0};
+        int queue[MAX_USERS]; int front = 0, back = 0;
+        for (int i = 0; i < MAX_USERS; i++) dist[i] = -1;
+        dist[s] = 0; visited[s] = 1; queue[back++] = s;
+        while (front < back) {
+            int u = queue[front++];
+            for (EdgeNode *e = g->users[u].adj; e; e = e->next) {
+                int v = findUserIndex(g, e->friendId);
+                if (v == -1 || !g->users[v].active || visited[v]) continue;
+                visited[v] = 1; dist[v] = dist[u] + 1; queue[back++] = v;
+                if (dist[v] > maxDist) { maxDist = dist[v]; uMax = s; vMax = v; }
+            }
+        }
+    }
+    if (uMax == -1) printf("  Single node or no edges.\n");
+    else printf("  Max separation: %d hops  (%s ↔ %s)\n",
+                maxDist, g->users[uMax].name, g->users[vMax].name);
+}
+
+void displayContactList(Graph *g) {
+    printBanner("Contact List (Adjacency List)");
+    for (int i = 0; i < g->userCount; i++) {
+        if (!g->users[i].active) continue;
+        printf("  %-15s →", g->users[i].name);
+        int cnt = 0;
+        for (EdgeNode *e = g->users[i].adj; e; e = e->next) {
+            int j = findUserIndex(g, e->friendId);
+            if (j != -1) { printf("  %s(w=%d)", g->users[j].name, e->weight); cnt++; }
+        }
+        if (!cnt) printf("(none)");
+        printf("\n");
+    }
+}
+
+/* FIX 15: displayUserNetwork – shows contact list AND full network
+   for a single user via BFS from that user */
+void displayUserNetwork(Graph *g, int userId) {
+    int idx = findUserIndex(g, userId);
+    if (idx == -1) { printf("[ERROR] User not found.\n"); return; }
+    printBanner("User Network");
+    printf("  User: %s\n\n", g->users[idx].name);
+
+    /* Direct contact list */
+    printf("  [Direct Connections]\n");
+    int directCnt = 0;
+    for (EdgeNode *e = g->users[idx].adj; e; e = e->next) {
+        int j = findUserIndex(g, e->friendId);
+        if (j != -1) { printf("    → %-15s  (weight=%d)\n", g->users[j].name, e->weight); directCnt++; }
+    }
+    if (!directCnt) printf("    (none)\n");
+
+    /* Full reachable network via BFS */
+    printf("\n  [Complete Reachable Network – BFS]\n");
+    int visited[MAX_USERS] = {0}, queue[MAX_USERS], dist[MAX_USERS];
+    int front = 0, back = 0;
+    for (int i = 0; i < MAX_USERS; i++) dist[i] = -1;
+    visited[idx] = 1; dist[idx] = 0; queue[back++] = idx;
+    while (front < back) {
+        int u = queue[front++];
+        for (EdgeNode *e = g->users[u].adj; e; e = e->next) {
+            int v = findUserIndex(g, e->friendId);
+            if (v == -1 || !g->users[v].active || visited[v]) continue;
+            visited[v] = 1; dist[v] = dist[u] + 1; queue[back++] = v;
+            printf("    Level %d: %-15s\n", dist[v], g->users[v].name);
+        }
+    }
+}
+
+void findMates(Graph *g, int userId, const char *field) {
+    int idx = findUserIndex(g, userId);
+    if (idx == -1) { printf("[ERROR] User not found.\n"); return; }
+    User *u = &g->users[idx];
+    const char *target = strcmp(field,"school")  == 0 ? u->school  :
+                         strcmp(field,"college") == 0 ? u->college :
+                         strcmp(field,"company") == 0 ? u->company : NULL;
+    if (!target) { printf("[ERROR] Invalid field.\n"); return; }
+    printf("  %s's %s-mates (at '%s'):\n", u->name, field, target);
+    int found = 0;
+    for (int i = 0; i < g->userCount; i++) {
+        if (!g->users[i].active || i == idx) continue;
+        const char *val = strcmp(field,"school")  == 0 ? g->users[i].school  :
+                          strcmp(field,"college") == 0 ? g->users[i].college : g->users[i].company;
+        if (strcmp(val, target) == 0) { printf("    → %s\n", g->users[i].name); found++; }
+    }
+    if (!found) printf("    (none)\n");
+}
+
+void hobbyGroups(Graph *g) {
+    printBanner("Potential Hobby Groups");
+    char unique[MAX_USERS * MAX_HOBBIES][MAX_NAME_LEN]; int uCnt = 0;
+    for (int i = 0; i < g->userCount; i++) {
+        if (!g->users[i].active) continue;
+        for (int h = 0; h < g->users[i].hobbyCount; h++) {
+            int dup = 0;
+            for (int k = 0; k < uCnt; k++)
+                if (strcmp(unique[k], g->users[i].hobbies[h]) == 0) { dup = 1; break; }
+            if (!dup) { strncpy(unique[uCnt], g->users[i].hobbies[h], MAX_NAME_LEN - 1); unique[uCnt][MAX_NAME_LEN-1]='\0'; uCnt++; }
+        }
+    }
+    for (int k = 0; k < uCnt; k++) {
+        printf("  [%s Group]\n", unique[k]);
+        for (int i = 0; i < g->userCount; i++) {
+            if (!g->users[i].active) continue;
+            for (int h = 0; h < g->users[i].hobbyCount; h++)
+                if (strcmp(g->users[i].hobbies[h], unique[k]) == 0)
+                    printf("    → %s\n", g->users[i].name);
+        }
+        printf("\n");
+    }
+}
+
+/* FIX 11: latestConnections shows EACH FRIEND's latest connections too */
+void latestConnections(Graph *g, int userId) {
+    int idx = findUserIndex(g, userId);
+    if (idx == -1) { printf("[ERROR] User not found.\n"); return; }
+    printBanner("Latest Connections");
+    printf("  User: %s\n\n", g->users[idx].name);
+
+    /* Sort this user's edges by timestamp descending (simple bubble sort) */
+    typedef struct { char name[MAX_NAME_LEN]; time_t ts; int fid; } Conn;
+    Conn conns[MAX_USERS]; int cnt = 0;
+    for (EdgeNode *e = g->users[idx].adj; e; e = e->next) {
+        int j = findUserIndex(g, e->friendId);
+        if (j == -1) continue;
+        strncpy(conns[cnt].name, g->users[j].name, MAX_NAME_LEN - 1);
+        conns[cnt].name[MAX_NAME_LEN - 1] = '\0';
+        conns[cnt].ts  = e->connectedAt;
+        conns[cnt].fid = e->friendId;
+        cnt++;
+    }
+    for (int i = 0; i < cnt - 1; i++)
+        for (int j = i + 1; j < cnt; j++)
+            if (conns[j].ts > conns[i].ts) { Conn tmp = conns[i]; conns[i] = conns[j]; conns[j] = tmp; }
+
+    printf("  [%s's connections – newest first]\n", g->users[idx].name);
+    for (int i = 0; i < cnt; i++) {
+        char buf[64]; struct tm *tm_info = localtime(&conns[i].ts);
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
+        printf("    → %-15s  at %s\n", conns[i].name, buf);
+    }
+    if (!cnt) printf("    (none)\n");
+
+    /* FIX 11: also show every friend's own latest connections */
+    printf("\n  [Each Friend's Latest Connections]\n");
+    for (int i = 0; i < cnt; i++) {
+        int fi = findUserIndex(g, conns[i].fid);
+        if (fi == -1) continue;
+        printf("\n    %-15s →", conns[i].name);
+        /* collect & sort */
+        Conn fc[MAX_USERS]; int fcnt = 0;
+        for (EdgeNode *e = g->users[fi].adj; e; e = e->next) {
+            int j = findUserIndex(g, e->friendId);
+            if (j == -1) continue;
+            strncpy(fc[fcnt].name, g->users[j].name, MAX_NAME_LEN - 1);
+            fc[fcnt].name[MAX_NAME_LEN-1] = '\0';
+            fc[fcnt].ts = e->connectedAt; fcnt++;
+        }
+        for (int a = 0; a < fcnt - 1; a++)
+            for (int b = a + 1; b < fcnt; b++)
+                if (fc[b].ts > fc[a].ts) { Conn tmp = fc[a]; fc[a] = fc[b]; fc[b] = tmp; }
+        for (int a = 0; a < fcnt; a++) {
+            char buf[64]; struct tm *t = localtime(&fc[a].ts);
+            strftime(buf, sizeof(buf), "%H:%M:%S", t);
+            printf("  %s(@%s)", fc[a].name, buf);
+        }
+        if (!fcnt) printf("  (none)");
+    }
+    printf("\n");
+}
+
+void displayProfile(Graph *g, int userId) {
+    int idx =findUserIndex(g, userId);
+    if (idx == -1){ 
+      printf("[ERROR] User not found.\n");
+       return;
+       }
+    User *u = &g->users[idx];
+    printLine('-', 50);
+    printf("  PROFILE: %-20s (id=%d)\n", u->name, u->id);
+    printLine('-', 50);
+    printf("  School  : %s\n  College : %s\n  Company : %s\n",u->school, u->college, u->company);
+    printf("  Hobbies : ");
+    for (int h = 0; h < u->hobbyCount; h++){
+        printf("%s%s", u->hobbies[h], h < u->hobbyCount - 1 ? ", " : "");
+    }
+    int cnt = 0;
+     for (EdgeNode *e = u->adj; e; e = e->next) cnt++;
+    printf("\n  Friends : %d\n", cnt);
+    printLine('-', 50);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   MAIN – Full Demo
+   ═══════════════════════════════════════════════════════════════ */
+
+int main(void) {
+    Graph g; 
+    memset(&g, 0, sizeof(g));
+
+    printBanner("PROFESSIONAL SOCIAL NETWORK ANALYZER ");
+    printf("  Graph-based LinkedIn-like Platform in C\n\n");
+
+    const char *h1[] = {"Cricket","Coding","Reading"};
+    const char *h2[] = {"Cricket","Photography"};
+    const char *h3[] = {"Coding","Music"};
+    const char *h4[] = {"Reading","Travel"};
+    const char *h5[] = {"Photography","Travel","Cricket"};
+    const char *h6[] = {"Coding","Gaming"};
+    const char *h7[] = {"Music","Reading"};
+  
+    int id1 = addUser(&g, "Kishan", "DPS School",  "IIT Delhi",   "Google",    h1, 3);
+    int id2 = addUser(&g, "Aman",   "St. Mary's",  "IIT Delhi",   "Microsoft", h2, 2);
+    int id3 = addUser(&g, "Ravi",   "DPS School",  "NIT Bhopal",  "Amazon",    h3, 2);
+    int id4 = addUser(&g, "Neha",   "Kendriya",    "IIT Delhi",   "Google",    h4, 2);
+    int id5 = addUser(&g, "Rahul",  "St. Mary's",  "NIT Bhopal",  "Infosys",   h5, 3);
+    int id6 = addUser(&g, "Priya",  "DPS School",  "BITS Pilani", "TCS",       h6, 2);
+    int id7 = addUser(&g, "Rohan",  "Kendriya",    "BITS Pilani", "Wipro",     h7, 2);
+    printf("\n");
+
+    printf("Adding connections...\n");
+    addConnection(&g, id1, id2);
+    addConnection(&g, id1, id3);
+    addConnection(&g, id1, id4);
+    addConnection(&g, id2, id5);
+    addConnection(&g, id3, id5);
+    addConnection(&g, id4, id6);
+    addConnection(&g, id5, id7);
+    addConnection(&g, id6, id7);
+    addConnection(&g, id2, id4);
+    printf("\n");
+
+    printf("Adding career edges (directed) for topological sort...\n");
+    addCareerEdge(&g, id1, id2);   /* Kishan mentored Aman */
+    addCareerEdge(&g, id1, id4);   /* Kishan mentored Neha */
+    addCareerEdge(&g, id2, id5);   /* Aman mentored Rahul */
+    addCareerEdge(&g, id4, id6);   /* Neha mentored Priya */
+    addCareerEdge(&g, id5, id7);   /* Rahul mentored Rohan */
+    addCareerEdge(&g, id3, id5);   /* Ravi mentored Rahul */
+    printf("\n");
+
+    displayContactList(&g);
+    printf("\n");
+
+    displayProfile(&g, id1);
+    displayProfile(&g, id5);
+    printf("\n");
+
+    bfsLevels(&g, id1, 3);
+    printf("\n");
+
+    dfsTraversal(&g, id1);
+    printf("\n");
+
+    topologicalSort(&g);
+    printf("\n");
+
+    primMST(&g);
+    printf("\n");
+
+    kruskalMST(&g);
+    printf("\n");
+
+    dijkstra(&g, id1);
+    printf("\n");
+
+    floydWarshall(&g);
+    printf("\n");
+
+    /* ── FIX 7: BFS & DFS Search ────────────────── */
+    searchByBFS(&g, id1, "hobby",   "Cricket");
+    printf("\n");
+    searchByDFS(&g, id1, "college", "IIT Delhi");
+    printf("\n");
+
+    /* ── Cycle Detection ─────────────────────────── */
+    detectCycle(&g);
+    printf("\n");
+
+    /* ── All Paths ───────────────────────────────── */
+    allPaths(&g, id1, id5);
+    printf("\n");
+
+    /* ── Graph Diameter ──────────────────────────── */
+    graphDiameter(&g);
+    printf("\n");
+
+    /* ── FIX 8: isConnected ──────────────────────── */
+    printBanner("Is Connected? (BFS)");
+    checkConnection(&g, id1, id7);
+    checkConnection(&g, id1, id5);
+    /* Test with a deleted user later */
+
+    /* ── FIX 9: Degree of Separation ────────────── */
+    printf("\n");
+    printBanner("Degree of Separation");
+    printDegreeOfSeparation(&g, id1, id7);
+    printDegreeOfSeparation(&g, id1, id5);
+    printDegreeOfSeparation(&g, id2, id6);
+
+    /* ── Find Mates ──────────────────────────────── */
+    printf("\n");
+    printBanner("Mates Finder");
+    findMates(&g, id1, "college");
+    findMates(&g, id1, "company");
+    findMates(&g, id1, "school");
+
+    /* ── Hobby Groups ────────────────────────────── */
+    printf("\n");
+    hobbyGroups(&g);
+
+    /* ── FIX 11: Full Latest Connections ─────────── */
+    latestConnections(&g, id1);
+
+    /* ── FIX 15: User Network (single user BFS) ──── */
+    printf("\n");
+    displayUserNetwork(&g, id1);
+
+    /* ── FIX 13: Delete + slot reuse demo ────────── */
+    printf("\n");
+    printBanner("Delete User + Slot Reuse (FIX 13)");
+    printf("  Active users before: %d  | slots used: %d\n", g.activeCount, g.userCount);
+    deleteUser(&g, id6);   /* delete Priya */
+    printf("  Active users after : %d  | slots used: %d\n", g.activeCount, g.userCount);
+    /* Add new user – should reuse Priya's slot */
+    const char *hn[] = {"Cricket","Painting"};
+    int idNew = addUser(&g, "Sneha", "DPS School", "IIT Delhi", "Google", hn, 2);
+    printf("  New user Sneha occupies slot (slot count still = %d)\n", g.userCount);
+    addConnection(&g, id1, idNew);
+    printf("\n");
+
+    /* ── Remove Connection Demo ──────────────────── */
+    printBanner("Remove Connection Demo");
+    removeConnection(&g, id1, id3);
+    printf("  Kishan's connections after removing Ravi:\n    ");
+    int ki = findUserIndex(&g, id1);
+    for (EdgeNode *e = g.users[ki].adj; e; e = e->next) {
+        int j = findUserIndex(&g, e->friendId);
+        if (j != -1) printf("%s  ", g.users[j].name);
+    }
+    printf("\n");
+
+    /* ── isConnected after deletion ──────────────── */
+    printf("\n");
+    printBanner("isConnected after changes");
+    checkConnection(&g, id1, id7);
+    checkConnection(&g, id1, idNew);
+
+    printf("\n");
+    
+    return 0;
+}
